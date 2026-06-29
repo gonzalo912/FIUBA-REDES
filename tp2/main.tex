@@ -1,0 +1,589 @@
+\documentclass[11pt, a4paper]{article}
+
+% --- Paquetes Básicos ---
+\usepackage[utf8]{inputenc}
+\usepackage[spanish]{babel}
+\usepackage{graphicx}
+\usepackage{amsmath}
+\usepackage{amsfonts}
+\usepackage{hyperref}
+\usepackage{geometry}
+\usepackage{booktabs} % Para tablas prolijas
+\usepackage{listings} % Para snippets de código si fuera necesario
+\usepackage{xcolor}
+
+\geometry{top=2.5cm, bottom=2.5cm, left=2.5cm, right=2.5cm}
+
+% --- Configuración de Enlaces ---
+\hypersetup{
+    colorlinks=true,
+    linkcolor=blue,
+    filecolor=magenta,      
+    urlcolor=cyan,
+    pdftitle={TP2 SDN-NAT - Informe},
+}
+
+% --- Configuración para Código (Opcional) ---
+\lstset{
+    backgroundcolor=\color{gray!10},
+    basicstyle=\ttfamily\small,
+    breaklines=true,
+    keywordstyle=\color{blue},
+    commentstyle=\color{green!50!black},
+    stringstyle=\color{red},
+    frame=single,
+    numbers=left,
+    numberstyle=\tiny\color{gray},
+    captionpos=b
+}
+
+% --- PORTADA ---
+\title{
+    \normalsize Universidad de Buenos Aires \\
+    \normalsize Facultad de Ingeniería \\
+    \normalsize Redes (TA048) / Introducción a los Sistemas Distribuidos (75.43) \\ [2cm]
+    \Large \textbf{Trabajo Práctico N$^{\circ}$ 2: SDN - NAT} \\
+    \large Implementación de NAT saliente con traducción por puertos (PAT) \\ [1cm]
+}
+
+\author{
+    \textbf{Integrantes:} \\
+    Campoliete, Manuel - 110479 \\
+    Flores, Omar - 112186 \\
+    Olmos, Gonzalo - 105410 \\
+    Thome, Milagros - 110684 \\
+    [2cm]
+}
+\date{23 de Junio de 2026} % Fecha de entrega pautada
+
+\begin{document}
+
+\maketitle
+\thispagestyle{empty}
+\clearpage
+\tableofcontents
+\clearpage
+
+% --- SECCIÓN 1 ---
+\section{Descripción General de la Solución}
+\label{sec:descripcion_general}
+
+El presente trabajo práctico consiste en la implementación de un NAT (Network Address Translation) con traducción de puertos (PAT --- Port Address Translation) sobre una arquitectura de redes definidas por software (SDN). Se utiliza Mininet como plataforma de emulación de red (plano de datos) y POX como controlador SDN (plano de control), comunicados mediante el protocolo OpenFlow 1.0.
+
+La topología consta de un switch central (s1) que conecta dos redes: una red pública (200.0.0.0/24) con un servidor h1, y una red privada (192.168.1.0/24) con una cantidad variable de hosts. El controlador POX, ejecutando el módulo \texttt{protorouter.py}, intercepta los paquetes que el switch no puede procesar por sí mismo (primer paquete de cada conexión, tramas ARP) a través de eventos \texttt{PacketIn}, y toma decisiones de ruteo y traducción.
+
+El funcionamiento general es el siguiente:
+
+\begin{enumerate}
+    \item Cuando un host privado desea comunicarse con la red pública, el controlador intercepta el primer paquete, reemplaza la dirección IP de origen (privada) por la IP pública del router (200.0.0.254) y asigna un puerto público efímero único para esa sesión. Simultáneamente, instala un par de flujos OpenFlow en el switch para que los paquetes subsiguientes sean traducidos directamente en el plano de datos, sin intervención del controlador.
+    \item El tráfico de respuesta proveniente del servidor público es interceptado por el switch, que gracias al flujo de retorno instalado previamente, traduce la IP de destino pública y el puerto a los valores originales del host privado.
+    \item Para el tráfico ICMP (como ping), se utiliza un mecanismo análogo con traducción de identificadores ICMP en lugar de puertos de transporte.
+    \item La resolución de direcciones MAC se realiza de forma completamente dinámica: el controlador responde ARP Requests para las IPs del router y aprende las tablas ARP observando el tráfico, eliminando la necesidad de configuraciones estáticas.
+\end{enumerate}
+
+De esta forma, múltiples hosts de la red privada pueden compartir una única IP pública, manteniendo la separación de conexiones mediante la asignación de puertos distintos en la capa de transporte.
+
+
+% --- SECCIÓN 2 ---
+\section{Extensión de la Topología}
+\label{sec:extension_topologia}
+
+Para satisfacer el escenario de múltiples clientes concurrentes en la red privada y evaluar correctamente el funcionamiento del NAT, se modificó el script original \texttt{topo.py}. En lugar de definir de manera estática una cantidad fija de hosts en la red privada, se parametrizó la creación de la topología para permitir una cantidad variable de los mismos.
+
+Mediante el argumento de ejecución \texttt{-ph} (o \texttt{--private-hosts}), el usuario puede indicar la cantidad de hosts privados deseados al levantar la topología. El script se encarga de instanciar dinámicamente dichos hosts, asignándoles direcciones IP correlativas dentro de la subred privada (comenzando por la \texttt{192.168.1.2}) y direcciones MAC acordes a su número de host para simplificar su identificación (por ejemplo, \texttt{00:00:00:00:00:02} para el host con IP terminada en \texttt{.2}). Todos estos hosts se enlazan al mismo switch central \texttt{s1}.
+
+Además, una modificación fundamental introducida en esta nueva topología es la eliminación completa de las configuraciones de ARP estático (anteriormente configuradas mediante el uso de \texttt{setARP}) que venían provistas en el archivo original. Debido a que el entorno y la resolución de direcciones ahora requieren de un descubrimiento puramente dinámico delegado a nuestro controlador SDN, las tablas ARP de los hosts inician vacías, permitiendo probar la lógica de intercepción y resolución ARP de manera realista.
+
+
+% --- SECCIÓN 3 ---
+\section{Manejo de ARP}
+\label{sec:manejo_arp}
+
+Para prescindir completamente de las configuraciones estáticas (como la instrucción \texttt{setARP} en \texttt{topo.py}), se implementó un mecanismo de resolución de direcciones ARP dinámico e inteligente en el controlador POX a través de una clase dedicada, \texttt{ArpHandler}.
+
+Cuando un host intenta enviar un paquete y desconoce la dirección MAC de su puerta de enlace (la interfaz del router), envía un paquete ARP Request en \textit{broadcast}. El controlador intercepta estos paquetes e inspecciona el encabezado. Si el ARP Request está destinado a la IP de la interfaz privada del router (\texttt{192.168.1.254}) o a su interfaz pública (\texttt{200.0.0.254}), el controlador asume su rol de \textit{Default Gateway} y genera de inmediato un paquete ARP Reply informando la dirección MAC correspondiente (\texttt{PRIVATE\_MAC} o \texttt{PUBLIC\_MAC}). Esto permite al host emisor completar su tabla ARP local y comenzar a transmitir el tráfico IP.
+
+Adicionalmente, el controlador aprende de forma proactiva observando todo el tráfico ARP entrante (tanto Requests como Replies). Cuando procesa estas tramas, extrae la información del emisor y registra o actualiza la relación entre la dirección IP y la dirección MAC en una tabla ARP dinámica interna (\texttt{arp\_table}).
+
+El aspecto más crítico de este mecanismo surge cuando el switch debe enrutar un paquete IP hacia un destino (ya sea hacia el servidor público exterior o hacia un host privado interno) y desconoce su dirección MAC y su puerto físico. Para no bloquear el hilo de ejecución del controlador, se diseñó una resolución \textbf{asincrónica}:
+\begin{enumerate}
+    \item Se consulta la IP de destino en la tabla ARP del \texttt{ArpHandler} para obtener su MAC y puerto.
+    \item Si la información no existe, se suspende momentáneamente el procesamiento de ese flujo. El paquete IP original (o evento) se almacena en una cola de espera (\texttt{waiting\_queue}), agrupado bajo la IP de destino que se desea resolver.
+    \item El controlador genera y envía proactivamente su propio ARP Request. Si el tráfico se dirige a la red pública, el request sale por el puerto WAN conocido (\texttt{PUBLIC\_PORT}). Sin embargo, si el tráfico ingresa hacia la red privada y se desconoce la ubicación exacta del host, el request se envía mediante una inundación (\textit{flood} vía \texttt{of.OFPP\_FLOOD}) por todos los puertos locales para localizar físicamente al dispositivo.
+    \item Dado que el procesamiento en POX está orientado a eventos, el controlador queda liberado para procesar otras tareas sin interrupciones.
+    \item Cuando finalmente se recibe el paquete ARP Reply del dispositivo, el controlador aprende y registra tanto su MAC como su puerto de conexión en la tabla. Inmediatamente después, desencola todos los eventos que estaban en pausa esperando por dicha IP y los reinyecta en el flujo principal de procesamiento (\texttt{\_handle\_PacketIn}), despachándolos en orden estricto de llegada (FIFO).
+\end{enumerate}
+
+Este sistema garantiza no solo la eliminación de las dependencias estáticas en la topología, sino que asegura un enrutamiento totalmente dinámico donde no se pierden paquetes IP legítimos mientras se lleva a cabo el proceso de descubrimiento de red.
+
+\subsection{Limpieza de Entradas ARP Obsoletas}
+Para evitar que la tabla ARP interna del controlador acumule entradas de hosts que ya no están activos, se implementó un mecanismo de \textit{reap} en el método \texttt{\_reap\_arp\_table()}. Cada vez que se aprende o refresca una entrada (invocando \texttt{learn\_arp\_entry()}), se recorre la tabla y se eliminan todas aquellas entradas cuyo \textit{timestamp} supere los \texttt{ENTRY\_TIMEOUT} segundos (30\,s, mismo valor utilizado para el \texttt{idle\_timeout} de los flujos OpenFlow). De esta forma, el plano de control y el plano de datos se mantienen sincronizados: si el switch elimina un flujo por inactividad, la entrada ARP correspondiente también será purgada en la próxima operación de aprendizaje.
+
+
+% --- SECCIÓN 4 ---
+\section{Diseño de la Tabla NAT}
+\label{sec:diseno_tabla_nat}
+
+\subsection{Estructura de Datos e Identificación de Conexiones}
+Para implementar el NAT con traducción de puertos (PAT) y soportar múltiples conexiones simultáneas, se diseñó la clase \texttt{NatHandler}, encargada de administrar el estado de las sesiones y la asignación dinámica de puertos. 
+
+Dado que el controlador debe inspeccionar la capa de transporte (TCP/UDP) y traducir el tráfico en ambas direcciones de forma eficiente, se utilizaron dos diccionarios (tablas hash) en Python que funcionan como índices bidireccionales:
+
+\begin{itemize}
+    \item \textbf{Tabla Directa (\texttt{nat\_table}):} Se consulta cuando un paquete sale de la red privada hacia la pública. Su clave de búsqueda es una tupla que identifica unívocamente la sesión de origen: \texttt{(protocolo, IP\_privada, puerto\_privado)}. El valor almacenado contiene el \texttt{puerto\_público} asignado, la IP pública del router y un \textit{timestamp}.
+    \item \textbf{Tabla Inversa (\texttt{reverse\_nat}):} Se consulta cuando el servidor público responde. La clave de búsqueda es la tupla \texttt{(protocolo, IP\_pública, puerto\_público\_destino)}. Al consultar este diccionario con el puerto de destino del paquete entrante, el router recupera en tiempo constante ($O(1)$) la IP y el puerto del host privado original para armar el flujo de retorno.
+\end{itemize}
+
+El \texttt{NatHandler} mantiene un conjunto (\textit{Set}) con los puertos públicos disponibles (desde el 1024). Al interceptar un flujo nuevo, se asigna el menor puerto disponible, asegurando que no existan colisiones entre las conexiones de diferentes hosts.
+
+\subsection{Ejemplo Conceptual de la Tabla}
+A continuación, se presenta un ejemplo de cómo se estructuran las asignaciones al establecerse dos conexiones en paralelo:
+
+\begin{table}[h!]
+\centering
+\begin{tabular}{ccccc}
+\toprule
+\textbf{Protocolo} & \textbf{IP Privada} & \textbf{Puerto Privado} & \textbf{IP Pública} & \textbf{Puerto Público} \\
+\midrule
+TCP & 192.168.1.2 & 50001 & 200.0.0.254 & 1024 \\
+UDP & 192.168.1.3 & 40002 & 200.0.0.254 & 1025 \\
+\bottomrule
+\end{tabular}
+\caption{Ejemplo de asignación de puertos en las tablas bidireccionales del PAT.}
+\label{tab:ejemplo_nat}
+\end{table}
+
+\subsection{Limpieza de Entradas NAT Expiradas}
+\label{subsec:gc_nat}
+
+Para evitar el agotamiento del pool de puertos públicos y mantener la coherencia con el plano de datos, se diseñó un mecanismo de \textit{garbage collection} dentro de \texttt{NatHandler}. El método \texttt{\_reap\_nat\_table()} itera sobre la \texttt{nat\_table} y elimina toda entrada cuyo \textit{timestamp} supere los \texttt{ENTRY\_TIMEOUT} segundos (30\,s). Por cada entrada eliminada se remueve también su contraparte en \texttt{reverse\_nat} y se libera el puerto público asociado mediante \texttt{release\_public\_port()}, devolviéndolo al conjunto de puertos disponibles para futuras conexiones.
+
+El reap se ejecuta de manera \textit{triggerada} (no por temporizador) en los dos puntos de entrada a la tabla NAT:
+\begin{itemize}
+    \item \texttt{create\_pat\_entry()}: antes de crear o consultar una traducción saliente.
+    \item \texttt{get\_reverse\_entry()}: antes de buscar una traducción entrante.
+\end{itemize}
+
+Esta estrategia cubre la mayoría de los casos prácticos, pero presenta una limitación conocida: si una conexión expira en el switch (por \texttt{idle\_timeout}) y posteriormente no se genera tráfico entrante ni saliente que pase por el controlador, la entrada NAT correspondiente nunca se limpiará hasta que alguna de las dos funciones mencionadas sea invocada por una conexión completamente distinta. En escenarios de baja actividad, esto podría retrasar la liberación de puertos públicos. Una posible mejora futura sería incorporar un temporizador periódico independiente que ejecute el reap de forma asíncrona, desacoplando la limpieza de los puntos de consulta del mapa.
+
+
+% --- SECCIÓN 5 ---
+\section{Estrategia de Instalación de Flujos}
+\label{sec:estrategia_flujos}
+
+Cada vez que el controlador recibe el primer \textit{PacketIn} de una conexión (ya sea saliente o entrante), en lugar de traducir paquete por paquete, instala un par de flujos OpenFlow en el switch (\texttt{ofp\_flow\_mod}) para que los paquetes subsiguientes sean procesados directamente en el plano de datos, sin intervención del controlador. Esto minimiza el \textit{overhead} de comunicación entre el switch y el controlador, reduciendo drásticamente la latencia de los paquetes siguientes.
+
+\subsection{Flujo Saliente (Privado → Público)}
+\label{subsec:flow_out}
+
+Cuando un paquete IP proveniente de la red privada llega al controlador, se instala un flujo que matchea los siguientes campos de la cabecera del paquete original:
+
+\begin{verbatim}
+  in_port, dl_type=0x800, nw_src, nw_dst, nw_proto, tp_src, tp_dst
+\end{verbatim}
+
+Las acciones aplicadas por el switch al matchear este flujo son:
+
+\begin{enumerate}
+    \item Reemplazar la IP de origen por la IP pública del router. \\
+          (\texttt{of.ofp\_action\_nw\_addr.set\_src})
+
+    \item Reemplazar el puerto de origen por el puerto público asignado por PAT. \\
+          (\texttt{of.ofp\_action\_tp\_port.set\_src})
+
+    \item Reemplazar la MAC de origen por la MAC de la interfaz pública. \\
+          (\texttt{of.ofp\_action\_dl\_addr.set\_src})
+
+    \item Reemplazar la MAC de destino por la MAC del host destino en la red pública. \\
+          (\texttt{of.ofp\_action\_dl\_addr.set\_dst})
+
+    \item Enviar el paquete por el puerto público. \\
+          (\texttt{of.ofp\_action\_output})
+\end{enumerate}
+
+\subsection{Flujo Entrante (Público → Privado)}
+\label{subsec:flow_in}
+
+Junto con el flujo saliente se instala un segundo flujo para el camino de retorno, de modo que la respuesta del servidor público también sea traducida automáticamente por el switch. Este flujo matchea:
+
+\begin{verbatim}
+  in_port=PUBLIC_PORT, dl_type=0x800, nw_src=<IP_destino_original>,
+  nw_dst=PUBLIC_IP, nw_proto, tp_src=<puerto_destino_original>,
+  tp_dst=<puerto_público_asignado>
+\end{verbatim}
+
+Y ejecuta las acciones inversas:
+
+\begin{enumerate}
+    \item Reemplazar la IP de destino por la IP privada original. \\
+          (\texttt{of.ofp\_action\_nw\_addr.set\_src})
+
+    \item Reemplazar el puerto de destino por el puerto privado original. \\
+          (\texttt{of.ofp\_action\_tp\_port.set\_src})
+
+    \item Reemplazar la MAC de origen por la MAC de la interfaz privada. \\
+          (\texttt{of.ofp\_action\_dl\_addr.set\_src})
+
+    \item Reemplazar la MAC de destino por la MAC del host privado. \\
+          (\texttt{of.ofp\_action\_dl\_addr.set\_dst})
+
+    \item Enviar el paquete por el puerto privado de entrada. \\
+          (\texttt{of.ofp\_action\_output})
+\end{enumerate}
+
+\subsection{Misma Estrategia para Tráfico Entrante}
+\label{subsec:flow_in_reverse}
+
+Cuando el primer paquete de una conexión entrante (respuesta del servidor público que coincide con una entrada PAT existente) llega al controlador, se aplica exactamente la misma lógica pero con los roles intercambiados: primero se instala el flujo que traduce de público a privado y luego el flujo complementario para que los próximos paquetes de la subsecuente comunicación saliente también sean traducidos en el switch.
+
+\subsection{\textit{Idle Timeout} y Liberación de Recursos}
+\label{subsec:timeout}
+
+Todos los flujos se instalan con \texttt{idle\_timeout = ENTRY\_TIMEOUT} (30 segundos), sin \texttt{hard\_timeout}. Esto significa que un flujo permanece activo mientras haya tráfico en la conexión, y se elimina automáticamente tras 30 segundos de inactividad. La elección de un valor bajo permite:
+
+\begin{itemize}
+    \item Liberar rápidamente las entradas en la tabla de flujos del switch (un recurso finito y costoso).
+    \item Sincronizar de forma natural la limpieza del plano de datos con la limpieza del plano de control: el mismo valor de \texttt{ENTRY\_TIMEOUT} se utiliza en los métodos \texttt{\_reap\_nat\_table()} y \texttt{\_reap\_arp\_table()} para purgar las entradas obsoletas en el controlador.
+    \item Evitar que conexiones efímeras (como las de navegación web o consultas DNS) dejen residuos en las tablas del switch.
+\end{itemize}
+
+No se utiliza \texttt{hard\_timeout} porque eliminar un flujo de forma forzosa mientras la conexión aún está activa generaría \textit{PacketIn} innecesarios al controlador, degradando el rendimiento.
+
+
+% --- SECCIÓN 6 ---
+\section{Decisiones de Diseño}
+\label{sec:decisiones_diseno}
+
+\subsection{Separación de Responsabilidades en Handlers}
+\label{subsec:handlers}
+
+Se optó por modelar cada funcionalidad del plano de control en una clase independiente: \texttt{ArpHandler} (resolución de direcciones), \texttt{NatHandler} (traducción PAT para TCP/UDP) e \texttt{IcmpHandler} (traducción de IDs para ICMP). El orquestador \texttt{ProtoRouter} las instancia como atributos propios y las utiliza sin conocer los detalles internos de cada una. Esta decisión sigue el principio de responsabilidad única (SRP): cada clase encapsula su propio estado (tablas, pools de recursos) y su lógica asociada, lo que facilita la lectura, el mantenimiento y eventuales pruebas unitarias.
+
+\subsection{Tabla NAT Bidireccional}
+\label{subsec:tabla_bidireccional}
+
+Para soportar la traducción en ambos sentidos con complejidad $O(1)$, se implementaron dos diccionarios paralelos:
+
+\begin{itemize}
+    \item \textbf{\texttt{nat\_table}}: clave \texttt{(protocolo, IP\_privada, puerto\_privado)} $\rightarrow$ datos de la traducción saliente.
+    \item \textbf{\texttt{reverse\_nat}}: clave \texttt{(protocolo, IP\_pública, puerto\_público)} $\rightarrow$ datos de la traducción entrante.
+\end{itemize}
+
+Con un solo diccionario, la búsqueda inversa (necesaria cuando llega un paquete del servidor público) requeriría recorrer todas las entradas en $O(n)$. La duplicación controlada de índices es una compensación aceptable de memoria por velocidad de consulta, crítica para el procesamiento en tiempo real de paquetes.
+
+\subsection{Algoritmo de Asignación de Puertos Públicos}
+\label{subsec:asignacion_puertos}
+
+El método \texttt{allocate\_public\_port()} selecciona el puerto disponible más bajo mediante \texttt{min()} sobre el conjunto \texttt{public\_port\_pool}. Se descartaron alternativas como:
+
+\begin{itemize}
+    \item \textbf{Asignación secuencial con índice}: requeriría mantener un contador global y lógica de \textit{wraparound}, además de gestionar huecos dejados por puertos liberados.
+    \item \textbf{Asignación aleatoria}: introduce impredecibilidad, lo que dificulta la depuración.
+\end{itemize}
+
+La función \texttt{min()} sobre un \texttt{set} produce un comportamiento determinista: los puertos se reasignan desde el valor más bajo disponible, llenando naturalmente los huecos dejados por conexiones finalizadas. Esto replica de forma simplificada la política de puertos efímeros de los sistemas operativos.
+
+\subsection{Pool de Puertos como \texttt{set} de Python}
+\label{subsec:pool_set}
+
+El conjunto de puertos públicos disponibles se implementa como un \texttt{set} de Python con el rango $[1024, 65535]$. Se privilegiaron los \texttt{set} sobre listas o colas porque:
+\begin{itemize}
+    \item Las operaciones de inserción (\texttt{add}) y eliminación (\texttt{remove}) son $O(1)$.
+    \item La estructura garantiza ausencia de duplicados, incluso si \texttt{release\_public\_port()} se invocara múltiples veces sobre el mismo puerto por error.
+\end{itemize}
+El rango comienza en 1024 para excluir puertos privilegiados (0--1023) y reservados (por ejemplo, 22, 80, 443), evitando colisiones con servicios estándar.
+
+\subsection{Estrategia de Limpieza de Entradas Expiradas}
+\label{subsec:reap}
+
+Se implementó un mecanismo de \textit{garbage collection} triggerado (no por temporizador) para depurar las tablas NAT, ARP e ICMP. Cada método público de consulta o creación ejecuta el reap antes de operar:
+
+\begin{itemize}
+    \item \texttt{create\_pat\_entry()} y \texttt{get\_reverse\_entry()} invocan \texttt{\_reap\_nat\_table()}.
+    \item \texttt{learn\_arp\_entry()} invoca \texttt{\_reap\_arp\_table()}.
+    \item Los métodos análogos de \texttt{IcmpHandler} siguen el mismo patrón.
+\end{itemize}
+
+Se descartó un temporizador periódico independiente para mantener el diseño simple y acoplado al flujo de eventos. La limitación conocida es que, en escenarios de inactividad total donde no se reciben \textit{PacketIn}, las entradas expiradas pueden permanecer hasta que una nueva conexión active el reap. Para un entorno académico con tráfico continuo durante las pruebas, esta estrategia es suficiente.
+
+\subsection{Sincronización de Timeouts con \texttt{ENTRY\_TIMEOUT}}
+\label{subsec:entry_timeout}
+
+Se definió la constante \texttt{ENTRY\_TIMEOUT = 30} (segundos) que se utiliza tanto para el \texttt{idle\_timeout} de los flujos OpenFlow como para la expiración de las entradas en los tres handlers (NAT, ARP e ICMP). Esta decisión garantiza coherencia temporal entre el plano de datos (switch) y el plano de control (controlador): cuando el switch elimina un flujo por inactividad, el controlador purga el estado asociado aproximadamente en el mismo intervalo. No se emplea \texttt{hard\_timeout} para evitar que un flujo se elimine forzosamente mientras la conexión sigue activa, lo que generaría \textit{PacketIn} innecesarios.
+
+\subsection{Resolución ARP Asincrónica con \texttt{waiting\_queue}}
+\label{subsec:arp_async}
+
+Cuando se necesita resolver una dirección MAC y la tabla ARP no contiene la entrada, el controlador no bloquea el procesamiento. En lugar de ello:
+\begin{enumerate}
+    \item Encola el evento (\texttt{PacketIn}) original en \texttt{waiting\_queue[IP\_destino]}.
+    \item Envía proactivamente un ARP Request (por el puerto público conocido o mediante flooding en la red privada).
+    \item Retorna el control a POX para procesar otros eventos.
+    \item Al recibir el ARP Reply, aprende la entrada y desencola todos los eventos pendientes para reinyectarlos en el flujo principal.
+\end{enumerate}
+Este diseño es obligatorio en un framework orientado a eventos como POX, donde no es posible realizar esperas bloqueantes. Además, garantiza que ningún paquete IP legítimo se pierda durante la resolución.
+
+\subsection{Instalación de Pares de Flujos Bidireccionales y Traducción del Primer Paquete}
+\label{subsec:flujos_pares}
+
+Por cada nueva conexión se instalan dos flujos OpenFlow (saliente y entrante) de forma simultánea. Esto minimiza la intervención del controlador: una vez instalados, todos los paquetes subsiguientes se traducen directamente en el switch. Como el primer paquete de la conexión no debe esperar a que los flujos se instalen para ser reenviado, el controlador lo traduce en software y lo envía inmediatamente mediante un \texttt{ofp\_packet\_out}. Los paquetes siguientes son manejados por los flujos en el plano de datos.
+
+\subsection{Delegación del Cálculo de Checksums}
+\label{subsec:checksums}
+
+Después de modificar direcciones IP, puertos o IDs ICMP, se asignan los campos \texttt{csum} a \texttt{None}. POX recalcula automáticamente los checksums IP y de transporte al empaquetar la trama. Esta decisión evita implementar manualmente el cálculo de checksums y reduce la probabilidad de errores en la traducción.
+
+\subsection{Manejo de ICMP como Protocolo Especial}
+\label{subsec:icmp}
+
+ICMP no posee puertos de transporte; utiliza un \texttt{icmp\_id} (campo \texttt{id} del \texttt{echo}) para identificar sesiones. Se creó un \texttt{IcmpHandler} independiente con su propio pool de IDs, análogo estructural al \texttt{NatHandler}. La función \texttt{\_get\_transport\_fields()} extrae el \texttt{icmp\_id} tanto como \texttt{src\_port} como \texttt{dst\_port}, lo que simplifica el manejo simétrico en los métodos \texttt{\_handle\_outgoing} y \texttt{\_handle\_incoming}.
+
+\subsection{Filtrado de Protocolos No Soportados}
+\label{subsec:filtrado}
+
+Se definió la tupla \verb|SUPPORTED_PROTOCOLS = ("TCP", "UDP", "ICMP")|. Cualquier paquete IP con un protocolo de transporte diferente es descartado. Esta decisión se fundamenta en que PAT requiere inspeccionar puertos de transporte (TCP/UDP) o IDs (ICMP); otros protocolos carecen de este concepto y no pueden ser traducidos con este esquema.
+
+\subsection{Refactorización con Métodos Auxiliares}
+\label{subsec:refactor}
+
+El código de \texttt{ProtoRouter} se organizó en métodos auxiliares reutilizables para evitar duplicación y mejorar la legibilidad:
+
+\begin{itemize}
+    \item \texttt{\_install\_flow()}: recibe un diccionario de campos match y una lista de acciones, construye y envía el \texttt{ofp\_flow\_mod}. Esto eliminó la repetición del bloque de instalación de flujos que antes aparecía cuatro veces.
+    \item \texttt{\_resolve\_mac()} y \texttt{\_resolve\_mac\_and\_port()}: encapsulan la lógica de consulta ARP, encolado y envío de ARP Request.
+    \item \texttt{\_clear\_checksums()}: centraliza la invalidación de checksums.
+    \item \texttt{\_send\_packet()}: construye y envía el \texttt{ofp\_packet\_out} con el logging correspondiente.
+\end{itemize}
+
+\subsection{Uso de Constantes Descriptivas}
+\label{subsec:constantes}
+
+Todos los parámetros configurables (subred privada, IPs, MACs, puertos, timeouts) se definen como constantes en el ámbito del módulo, eliminando valores mágicos dispersos en el código. Esto facilita la modificación de la configuración sin necesidad de buscar literales en el cuerpo de las funciones.
+
+
+% --- SECCIÓN 7 ---
+\section{Problemas Encontrados y Soluciones Implementadas}
+\label{sec:problemas_soluciones}
+
+\vspace{0.5cm}
+
+\subsection{Checksums Incorrectos al Traducir Paquetes}
+
+Durante las primeras pruebas de conectividad, observamos que los paquetes IP modificados por el controlador (por ejemplo, un ping desde un host privado hacia el servidor público) nunca llegaban a su destino. Utilizando \texttt{tcpdump} y Wireshark para inspeccionar el tráfico en ambos extremos, notamos que los paquetes eran enviados correctamente por el switch, pero el receptor los descartaba silenciosamente.
+
+Luego de analizar las capturas, descubrimos que el problema radicaba en los checksums: al modificar campos como la dirección IP de origen, el puerto de origen o el identificador ICMP, los checksums de la cabecera IP (\texttt{csum}) y de la capa de transporte (\texttt{next.csum}) quedaban desactualizados. El switch no recalcula estos valores automáticamente, por lo que se enviaban con un checksum inválido y el receptor los descartaba.
+
+\subsubsection{Solución Implementada}
+
+Para resolverlo, creamos el método \texttt{\_clear\_checksums()}, que asigna \texttt{None} a ambos checksums antes de serializar y enviar el paquete:
+
+\begin{lstlisting}[language=Python, caption=Método \texttt{\_clear\_checksums} en \texttt{protorouter.py}.]
+def _clear_checksums(self, ip_pkt):
+    ip_pkt.csum = None
+    ip_pkt.next.csum = None
+\end{lstlisting}
+
+Al establecer los checksums en \texttt{None}, la librería POX los recalcula automáticamente durante la serialización (\texttt{pack()}), garantizando que el paquete llegue con valores correctos al destino. Esta solución se aplica en todos los puntos donde se modifican campos de IP, transporte o ICMP antes de enviar el paquete.
+
+\subsection{Comunicación ARP entre Hosts Privados}
+
+Otro problema que nos tomó bastante tiempo diagnosticar fue la imposibilidad de que dos hosts de la red privada se comunicaran entre sí. En nuestra topología, todos los hosts privados (h2, h3, etc.) están conectados directamente al mismo switch. Cuando h2 quería comunicarse con h3, enviaba un ARP Request con dirección Ethernet de broadcast y dirección IP de destino igual a la IP de h3.
+
+El ARP Request llegaba al switch, que al no tener un flujo instalado para ese tráfico, lo reenviaba al controlador mediante un \texttt{PacketIn}. En ese momento, el controlador procesaba el paquete e inspeccionaba la IP de destino del ARP. Como esta IP no coincidía ni con \texttt{PUBLIC\_IP} ni con \texttt{PRIVATE\_IP} (las IPs del router), nuestra lógica original descartaba el paquete silenciosamente al llegar al \texttt{else} del bloque de comparación:
+
+\begin{lstlisting}[language=Python, caption=Lógica original que descartaba ARP entre privados.]
+if target_ip == PUBLIC_IP:
+    # ...
+elif target_ip == PRIVATE_IP:
+    # ...
+else:
+    return  # <-- Aca se descartaba el ARP entre privados
+\end{lstlisting}
+
+Como consecuencia, h2 nunca recibía una respuesta ARP, no podía resolver la MAC de h3 y la comunicación entre ambos era imposible.
+
+\subsubsection{Solución Implementada}
+
+La solución fue agregar una verificación temprana: si tanto el emisor como el destino del ARP Request pertenecen a la subred privada y el destino no es la IP del router, el paquete se reenvía mediante \textit{flooding} (\texttt{of.OFPP\_FLOOD}) por todos los puertos del switch. De esta forma, el ARP Request llega al host destino (h3), que responde directamente con un ARP Reply, y la comunicación privada-privada funciona con normalidad.
+
+\begin{lstlisting}[language=Python, caption=Flooding de ARP entre hosts privados agregado en \texttt{handle\_arp()}.]
+# ARP entre hosts privados -> flood para que el destino lo reciba
+if sender_ip.inNetwork(PRIVATE_SUBNET, PRIVATE_MASK) \
+        and target_ip.inNetwork(PRIVATE_SUBNET, PRIVATE_MASK) \
+        and target_ip != PRIVATE_IP:
+    self._send_packet(event.parsed, packet.src, packet.dst, of.OFPP_FLOOD,
+        f"ARP flooded: {sender_ip} -> {target_ip}")
+    return
+\end{lstlisting}
+
+Esta solución es simple y efectiva: el ARP Request solo pasa por el controlador la primera vez; una vez que h3 responde, h2 obtiene la MAC y envía el primer paquete IP, momento en el cual el controlador instala los flujos OpenFlow correspondientes. A partir de ahí, el tráfico posterior entre ambos hosts viaja directamente por el plano de datos sin molestar al controlador.
+
+
+% --- SECCIÓN 8 ---
+\section{Pruebas Realizadas}
+\label{sec:pruebas}
+
+\subsection{Preparación}
+
+Antes de comenzar las pruebas, asegurarse de que las direcciones IP y MAC en el archivo \texttt{util/constants.py} reflejen la topología deseada (por defecto: red privada \texttt{192.168.1.0/24} con router en \texttt{192.168.1.254}, red pública \texttt{200.0.0.0/24} con router en \texttt{200.0.0.254}). Luego:
+
+\begin{enumerate}
+    \item En una terminal, iniciar el controlador POX:
+\begin{verbatim}
+cp protorouter.py /opt/pox/ext/
+cd /opt/pox
+python3 pox.py log.level --DEBUG protorouter
+\end{verbatim}
+    \item En una segunda terminal, ejecutar la topología de Mininet con 2 hosts privados:
+\begin{verbatim}
+sudo python3 topo.py -ph 2
+\end{verbatim}
+    \item Desde la consola de Mininet, abrir terminales xterm para h1, h2 y h3:
+\begin{verbatim}
+mininet> xterm h1 h2 h3
+\end{verbatim}
+    \item En una tercera terminal de Linux (sin salir de Mininet), preparar el comando para inspeccionar los flujos del switch:
+\begin{verbatim}
+watch ovs-ofctl dump-flows s1
+\end{verbatim}
+\end{enumerate}
+
+\subsection{Prueba 1: Server y un Cliente --- TCP}
+
+\textbf{Objetivo:} Verificar la traducción NAT para una conexión TCP entre un host privado (h2) y el servidor público (h1).
+
+\textbf{Procedimiento:}
+\begin{enumerate}
+    \item En las xterm de h2 y h1, iniciar Wireshark:
+\begin{verbatim}
+mininet> h2 wireshark >/dev/null 2>&1 &
+mininet> h1 wireshark >/dev/null 2>&1 &
+\end{verbatim}
+    \item En la xterm de h1, correr el servidor iperf en modo TCP:
+\begin{verbatim}
+iperf -s
+\end{verbatim}
+    \item Iniciar la captura en ambas instancias de Wireshark.
+    \item En la xterm de h2, ejecutar el cliente iperf:
+\begin{verbatim}
+iperf -c 200.0.0.1
+\end{verbatim}
+    \item Inspeccionar los flujos del switch en la tercera terminal.
+\end{enumerate}
+
+\textbf{Verificaciones:}
+\begin{itemize}
+    \item En la salida de iperf del servidor (h1), se ve que la conexión proviene de la IP pública del NAT (\texttt{200.0.0.254}) y no de la IP privada de h2.
+    \item En Wireshark de h2 se observa: el ARP Request/Reply entre h2 y el router (MAC privada), seguido del tráfico TCP con IP origen \texttt{192.168.1.2}.
+    \item En Wireshark de h1 se observa: el ARP Request/Reply entre el router (MAC pública) y h1, seguido del tráfico TCP con IP origen \texttt{200.0.0.254}.
+    \item En \texttt{ovs-ofctl dump-flows s1} aparecen dos flujos instalados: uno para el sentido saliente (match: IP/MAC/puertos privados; actions: \texttt{set\_nw\_src}, \texttt{set\_tp\_src}, \texttt{set\_dl\_src}, \texttt{set\_dl\_dst}, \texttt{output}) y otro para el sentido entrante.
+\end{itemize}
+
+% Colocar aqui captura de iperf server mostrando conexion desde 200.0.0.254
+% \begin{figure}[h!]
+%     \centering
+%     \includegraphics[width=0.8\textwidth]{capturas/iperf_server_tcp.png}
+%     \caption{Salida de iperf -s en h1 mostrando conexión desde 200.0.0.254:1024}
+%     \label{fig:iperf_server_tcp}
+% \end{figure}
+
+% Colocar aqui captura de ovs-ofctl dump-flows s1 mostrando los dos flujos
+% \begin{figure}[h!]
+%     \centering
+%     \includegraphics[width=0.8\textwidth]{capturas/dump_flows_tcp.png}
+%     \caption{Flujos OpenFlow instalados en s1 después de la conexión TCP}
+%     \label{fig:dump_flows_tcp}
+% \end{figure}
+
+\subsection{Prueba 2: Server y un Cliente --- UDP}
+
+\textbf{Objetivo:} Repetir la prueba anterior con tráfico UDP.
+
+\textbf{Procedimiento:}
+\begin{enumerate}
+    \item En la xterm de h1, correr el servidor iperf en modo UDP:
+\begin{verbatim}
+iperf -s -u
+\end{verbatim}
+    \item Iniciar capturas en Wireshark (h1 y h2).
+    \item En la xterm de h2, ejecutar el cliente iperf en modo UDP:
+\begin{verbatim}
+iperf -c 200.0.0.1 -u
+\end{verbatim}
+    \item Verificar en la terminal del controlador POX que se asigna un puerto público (1024) para esta sesión UDP.
+    \item Inspeccionar los flujos instalados.
+\end{enumerate}
+
+\textbf{Verificaciones:}
+\begin{itemize}
+    \item La conexión UDP llega a h1 desde \texttt{200.0.0.254} con un puerto origen traducido.
+    \item En Wireshark se ve la traducción de IP origen y puerto origen en los datagramas UDP.
+    \item Los flujos en el switch incluyen \texttt{nw\_proto=17} (UDP).
+\end{itemize}
+
+% Colocar aqui captura de Wireshark en h1 mostrando UDP con src IP 200.0.0.254:1024
+% \begin{figure}[h!]
+%     \centering
+%     \includegraphics[width=0.8\textwidth]{capturas/wireshark_udp_nat.png}
+%     \caption{Captura en h1 del tráfico UDP traducido (src 200.0.0.254:1024)}
+%     \label{fig:wireshark_udp}
+% \end{figure}
+
+\subsection{Prueba 3: Múltiples Clientes Simultáneos}
+
+\textbf{Objetivo:} Demostrar que la implementación maneja correctamente múltiples conexiones concurrentes, asignando puertos públicos distintos para cada sesión.
+
+\textbf{Procedimiento:}
+\begin{enumerate}
+    \item En la xterm de h1, correr el servidor iperf en modo TCP:
+\begin{verbatim}
+iperf -s
+\end{verbatim}
+    \item Desde la consola de Mininet, ejecutar simultáneamente 2 o 3 clientes iperf desde distintos hosts privados:
+\begin{verbatim}
+mininet> h2 iperf -c 200.0.0.1 -t 5 &
+mininet> h3 iperf -c 200.0.0.1 -t 5 &
+mininet> h4 iperf -c 200.0.0.1 -t 5 &
+\end{verbatim}
+    \item Observar en la salida de iperf del servidor (h1) las tres conexiones, cada una con una IP origen \texttt{200.0.0.254} pero con puertos origen distintos (1024, 1025, 1026, etc.).
+    \item Repetir la prueba con UDP:
+\begin{verbatim}
+mininet> h1 iperf -s -u &
+mininet> h2 iperf -c 200.0.0.1 -u -t 5 &
+mininet> h3 iperf -c 200.0.0.1 -u -t 5 &
+mininet> h4 iperf -c 200.0.0.1 -u -t 5 &
+\end{verbatim}
+\end{enumerate}
+
+\textbf{Explicación del manejo de concurrencia:} La implementación distingue cada conexión mediante una clave compuesta por el protocolo, la IP privada y el puerto privado del host emisor. Al llegar el primer paquete de una conexión, el \texttt{NatHandler} asigna el menor puerto público disponible (comenzando en 1024) y registra la entrada en dos tablas hash bidireccionales: \texttt{nat\_table} para la búsqueda saliente (privado $\rightarrow$ público) y \texttt{reverse\_nat} para la búsqueda entrante (público $\rightarrow$ privado). Esto garantiza que, aunque múltiples hosts compartan la misma IP pública, cada sesión tenga un puerto público exclusivo que permite demultiplexar correctamente las respuestas.
+
+% Colocar aqui captura de iperf server mostrando 3 conexiones con distintos puertos
+% \begin{figure}[h!]
+%     \centering
+%     \includegraphics[width=0.8\textwidth]{capturas/iperf_multi_cliente.png}
+%     \caption{Servidor iperf mostrando tres conexiones simultáneas con puertos origen distintos}
+%     \label{fig:iperf_multi_cliente}
+% \end{figure}
+
+% Colocar aqui captura de ovs-ofctl dump-flows s1 con los flujos de las 3 conexiones
+% \begin{figure}[h!]
+%     \centering
+%     \includegraphics[width=0.8\textwidth]{capturas/dump_flows_multi.png}
+%     \caption{Flujos OpenFlow instalados para tres conexiones simultáneas}
+%     \label{fig:dump_flows_multi}
+% \end{figure}
+
+
+% --- SECCIÓN 9 ---
+\section{Conclusión}
+\label{sec:conclusion}
+
+En este trabajo práctico se implementó un NAT con traducción de puertos (PAT) sobre una arquitectura SDN utilizando Mininet y POX, demostrando las ventajas que ofrece la separación entre el plano de control y el plano de datos en redes definidas por software.
+
+El principal beneficio del enfoque SDN fue la posibilidad de implementar lógica de traducción compleja (reescritura de IPs, puertos e IDs ICMP, resolución ARP dinámica, y gestión de tablas de estado) íntegramente en software, sobre un controlador centralizado, sin requerir modificaciones en el hardware de red. La instalación de flujos OpenFlow bidireccionales permitió que, una vez procesado el primer paquete de cada conexión, el switch realizara las traducciones de forma autónoma, minimizando el overhead de comunicación con el controlador.
+
+Sin embargo, se identificaron ciertas limitaciones. La principal es que el primer paquete de cada conexión debe necesariamente pasar por el controlador (\textit{slow path}), lo que introduce latencia adicional y puede generar reordenamiento de datagramas en el destino. Además, el mecanismo de limpieza de entradas expiradas (\textit{garbage collection}) está acoplado a la llegada de eventos, por lo que en escenarios de inactividad total las entradas pueden persistir más allá de su tiempo de expiración teórico.
+
+A futuro, las mejoras podrían incluir: un temporizador periódico independiente para la limpieza de tablas, soporte para protocolos adicionales, y la implementación de NAT de red completa (incluyendo tráfico entrante no solicitado mediante reglas de reenvío de puertos). No obstante, para el alcance académico propuesto, la solución cumple satisfactoriamente con los requisitos de conectividad, multiplexación de puertos y resolución dinámica de direcciones.
+
+\end{document}

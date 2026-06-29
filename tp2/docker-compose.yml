@@ -1,0 +1,10 @@
+services:
+  mininet:
+    build: .
+    container_name: tp2-mininet
+    privileged: true
+    stdin_open: true
+    tty: true
+    working_dir: /workspace
+    volumes:
+      - ./src:/workspace
